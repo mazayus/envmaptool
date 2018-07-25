@@ -1,0 +1,15 @@
+EnvMapTool
+
+
+
+Dependencies:
+SDL2
+
+Building:
+mkdir build
+cd build
+cmake ..
+make
+
+Build options:
+DEBUG_OPENGL        - enable OpenGL debug messages
