@@ -5,6 +5,8 @@
 uniform samplerCube u_EnvMap;
 
 uniform int u_NumSamples;
+uniform int u_StartSample;
+uniform int u_EndSample;
 
 uniform float u_Roughness;
 
@@ -36,8 +38,10 @@ vec3 FilterEnvMap(in mat3 TBN)
     vec3 Integral = vec3(0, 0, 0);
 
     uint NumSamples = uint(u_NumSamples);
+    uint StartSample = uint(u_StartSample);
+    uint EndSample = uint(u_EndSample);
 
-    for (uint i = 0u; i < NumSamples; ++i)
+    for (uint i = StartSample; i < EndSample; ++i)
     {
         vec2 Xi = Hammersley(i, NumSamples);
 

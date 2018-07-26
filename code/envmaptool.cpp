@@ -782,6 +782,15 @@ struct DisplaySettings
     float exposure;
 };
 
+struct FilterTaskProgress
+{
+    FilterSettings filter_params;
+
+    bool is_running;
+    int num_samples_completed;
+    int num_samples_per_frame;
+};
+
 struct EnvMapTool
 {
     Camera camera;
@@ -803,6 +812,8 @@ struct EnvMapTool
     CubeMapLayout layout;
 
     Mesh sphere_mesh;
+
+    FilterTaskProgress filter_task;
 };
 
 static void InitEnvMapTool(EnvMapTool* tool);
@@ -1543,6 +1554,11 @@ static void InitEnvMapTool(EnvMapTool* tool)
     tool->layout = CUBEMAP_LAYOUT_HORIZONTAL_CROSS;
 
     GenerateIcoSphereMesh(&tool->sphere_mesh, 3);
+
+    tool->filter_task.filter_params = tool->filter;
+    tool->filter_task.is_running = false;
+    tool->filter_task.num_samples_completed = 0;
+    tool->filter_task.num_samples_per_frame = 32; // FIXME: hardcoded
 }
 
 #define SH_MAX_DEGREE 9
@@ -1587,17 +1603,59 @@ static void FilterCubeMap_Cosine_SH(EnvMapTool* tool)
     UploadCubeMapToGPU(tool->filtered_env_map);
 }
 
-static void FilterCubeMap_Cosine(EnvMapTool* tool)
+static void BeginFilterCubeMap(EnvMapTool* tool, int face_size, int max_mip_level)
 {
-    int face_size = tool->filter.face_size;
-    int num_samples = tool->filter.num_samples;
-
     if (tool->filtered_env_map) FreeCubeMap(tool->filtered_env_map);
-    tool->filtered_env_map = AllocateCubeMap(1, face_size);
+    tool->filtered_env_map = AllocateCubeMap(max_mip_level + 1, face_size);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, tool->filtered_env_map->gl_id);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, max_mip_level);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
+
+    for (int mip = 0; mip <= max_mip_level; mip++)
+    {
+        glViewport(0, 0, face_size, face_size);
+
+        for (int face = 0; face < 6; ++face)
+        {
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, mip, GL_RGBA32F, face_size, face_size, 0,
+                         GL_RGB, GL_FLOAT, NULL);
+
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
+                                   tool->filtered_env_map->gl_id, mip);
+
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+
+        face_size /= 2;
+        if (face_size == 0)
+            break;
+    }
+
+    tool->filter_task.filter_params = tool->filter;
+    tool->filter_task.is_running = true;
+    tool->filter_task.num_samples_completed = 0;
+    tool->filter_task.num_samples_per_frame = 32; // FIXME: hardcoded
+}
+
+static void UpdateFilterCubeMap_Cosine(EnvMapTool* tool)
+{
+    const FilterSettings params = tool->filter_task.filter_params;
+
+    int face_size = params.face_size;
+    int num_samples = params.num_samples;
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_BLEND);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
 
     glUseProgram(tool->filter_cosine_program.id);
 
@@ -1606,52 +1664,54 @@ static void FilterCubeMap_Cosine(EnvMapTool* tool)
 
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_CUBE_MAP, tool->filtered_env_map->gl_id);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 0);
 
     glUniform1i(glGetUniformLocation(tool->filter_cosine_program.id, "u_EnvMap"), 0);
 
+    int start_sample = tool->filter_task.num_samples_completed;
+    int end_sample = start_sample + tool->filter_task.num_samples_per_frame;
+    if (end_sample > num_samples) end_sample = num_samples;
+
     glUniform1i(glGetUniformLocation(tool->filter_cosine_program.id, "u_NumSamples"), num_samples);
+    glUniform1i(glGetUniformLocation(tool->filter_cosine_program.id, "u_StartSample"), start_sample);
+    glUniform1i(glGetUniformLocation(tool->filter_cosine_program.id, "u_EndSample"), end_sample);
 
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
+
     glViewport(0, 0, face_size, face_size);
 
     for (int face = 0; face < 6; ++face)
     {
-        glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, GL_RGBA32F, face_size, face_size, 0,
-                     GL_RGB, GL_FLOAT, NULL);
-
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
                                tool->filtered_env_map->gl_id, 0);
-
-        glClear(GL_COLOR_BUFFER_BIT);
 
         glUniformMatrix3fv(glGetUniformLocation(tool->filter_cosine_program.id, "u_FaceBasis"), 1, GL_FALSE,
                            (const float*) (g_CubeMapFaces + face));
 
         glBindVertexArray(tool->filter_vao);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-        fprintf(stderr, "face %d done\n", face);
-        glFinish();
     }
+
+    tool->filter_task.num_samples_completed = end_sample;
+    if (tool->filter_task.num_samples_completed == num_samples)
+        tool->filter_task.is_running = false;
 }
 
-static void FilterCubeMap_PhongCosine(EnvMapTool* tool)
+static void UpdateFilterCubeMap_PhongCosine(EnvMapTool* tool)
 {
-    int face_size = tool->filter.face_size;
-    int max_mip_level = tool->filter.max_mip_level;
-    int num_samples = tool->filter.num_samples;
-    float specular_exponent = tool->filter.specular_exponent;
-    float specular_exponent_divisor = tool->filter.specular_exponent_divisor;
+    const FilterSettings params = tool->filter_task.filter_params;
 
-    if (tool->filtered_env_map) FreeCubeMap(tool->filtered_env_map);
-    tool->filtered_env_map = AllocateCubeMap(max_mip_level + 1, face_size);
+    int face_size = params.face_size;
+    int max_mip_level = params.max_mip_level;
+    int num_samples = params.num_samples;
+    float specular_exponent = params.specular_exponent;
+    float specular_exponent_divisor = params.specular_exponent_divisor;
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_BLEND);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
 
     glUseProgram(tool->filter_phong_cosine_program.id);
 
@@ -1660,41 +1720,36 @@ static void FilterCubeMap_PhongCosine(EnvMapTool* tool)
 
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_CUBE_MAP, tool->filtered_env_map->gl_id);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, max_mip_level);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
 
     glUniform1i(glGetUniformLocation(tool->filter_phong_cosine_program.id, "u_EnvMap"), 0);
 
+    int start_sample = tool->filter_task.num_samples_completed;
+    int end_sample = start_sample + tool->filter_task.num_samples_per_frame;
+    if (end_sample > num_samples) end_sample = num_samples;
+
     glUniform1i(glGetUniformLocation(tool->filter_phong_cosine_program.id, "u_NumSamples"), num_samples);
+    glUniform1i(glGetUniformLocation(tool->filter_phong_cosine_program.id, "u_StartSample"), start_sample);
+    glUniform1i(glGetUniformLocation(tool->filter_phong_cosine_program.id, "u_EndSample"), end_sample);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
 
     for (int mip = 0; mip <= max_mip_level; mip++)
     {
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
         glViewport(0, 0, face_size, face_size);
 
         glUniform1f(glGetUniformLocation(tool->filter_phong_cosine_program.id, "u_SpecularExponent"), specular_exponent);
 
         for (int face = 0; face < 6; ++face)
         {
-            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, mip, GL_RGBA32F, face_size, face_size, 0,
-                         GL_RGB, GL_FLOAT, NULL);
-
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                    GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
                                    tool->filtered_env_map->gl_id, mip);
-
-            glClear(GL_COLOR_BUFFER_BIT);
 
             glUniformMatrix3fv(glGetUniformLocation(tool->filter_phong_cosine_program.id, "u_FaceBasis"), 1, GL_FALSE,
                                (const float*) (g_CubeMapFaces + face));
 
             glBindVertexArray(tool->filter_vao);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-            fprintf(stderr, "mip %d face %d done\n", mip, face);
-            glFinish();
         }
 
         face_size /= 2;
@@ -1703,22 +1758,27 @@ static void FilterCubeMap_PhongCosine(EnvMapTool* tool)
 
         specular_exponent /= specular_exponent_divisor;
     }
+
+    tool->filter_task.num_samples_completed = end_sample;
+    if (tool->filter_task.num_samples_completed == num_samples)
+        tool->filter_task.is_running = false;
 }
 
-static void FilterCubeMap_BeckmannCosine(EnvMapTool* tool)
+static void UpdateFilterCubeMap_BeckmannCosine(EnvMapTool* tool)
 {
-    int face_size = tool->filter.face_size;
-    int max_mip_level = tool->filter.max_mip_level;
-    int num_samples = tool->filter.num_samples;
-    float roughness = tool->filter.roughness;
-    float roughness_increment = tool->filter.roughness_increment;
+    const FilterSettings params = tool->filter_task.filter_params;
 
-    if (tool->filtered_env_map) FreeCubeMap(tool->filtered_env_map);
-    tool->filtered_env_map = AllocateCubeMap(max_mip_level + 1, face_size);
+    int face_size = params.face_size;
+    int max_mip_level = params.max_mip_level;
+    int num_samples = params.num_samples;
+    float roughness = params.roughness;
+    float roughness_increment = params.roughness_increment;
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_BLEND);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
 
     glUseProgram(tool->filter_beckmann_cosine_program.id);
 
@@ -1727,18 +1787,21 @@ static void FilterCubeMap_BeckmannCosine(EnvMapTool* tool)
 
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_CUBE_MAP, tool->filtered_env_map->gl_id);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, max_mip_level);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
 
     glUniform1i(glGetUniformLocation(tool->filter_beckmann_cosine_program.id, "u_EnvMap"), 0);
 
+    int start_sample = tool->filter_task.num_samples_completed;
+    int end_sample = start_sample + tool->filter_task.num_samples_per_frame;
+    if (end_sample > num_samples) end_sample = num_samples;
+
     glUniform1i(glGetUniformLocation(tool->filter_beckmann_cosine_program.id, "u_NumSamples"), num_samples);
+    glUniform1i(glGetUniformLocation(tool->filter_beckmann_cosine_program.id, "u_StartSample"), start_sample);
+    glUniform1i(glGetUniformLocation(tool->filter_beckmann_cosine_program.id, "u_EndSample"), end_sample);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
 
     for (int mip = 0; mip <= max_mip_level; mip++)
     {
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
         glViewport(0, 0, face_size, face_size);
 
         roughness = Math::Clamp(roughness, 0, 1);
@@ -1746,23 +1809,15 @@ static void FilterCubeMap_BeckmannCosine(EnvMapTool* tool)
 
         for (int face = 0; face < 6; ++face)
         {
-            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, mip, GL_RGBA32F, face_size, face_size, 0,
-                         GL_RGB, GL_FLOAT, NULL);
-
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                    GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
                                    tool->filtered_env_map->gl_id, mip);
-
-            glClear(GL_COLOR_BUFFER_BIT);
 
             glUniformMatrix3fv(glGetUniformLocation(tool->filter_beckmann_cosine_program.id, "u_FaceBasis"), 1, GL_FALSE,
                                (const float*) (g_CubeMapFaces + face));
 
             glBindVertexArray(tool->filter_vao);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-            fprintf(stderr, "mip %d face %d done\n", mip, face);
-            glFinish();
         }
 
         face_size /= 2;
@@ -1771,22 +1826,27 @@ static void FilterCubeMap_BeckmannCosine(EnvMapTool* tool)
 
         roughness += roughness_increment;
     }
+
+    tool->filter_task.num_samples_completed = end_sample;
+    if (tool->filter_task.num_samples_completed == num_samples)
+        tool->filter_task.is_running = false;
 }
 
-static void FilterCubeMap_GGXCosine(EnvMapTool* tool)
+static void UpdateFilterCubeMap_GGXCosine(EnvMapTool* tool)
 {
-    int face_size = tool->filter.face_size;
-    int max_mip_level = tool->filter.max_mip_level;
-    int num_samples = tool->filter.num_samples;
-    float roughness = tool->filter.roughness;
-    float roughness_increment = tool->filter.roughness_increment;
+    const FilterSettings params = tool->filter_task.filter_params;
 
-    if (tool->filtered_env_map) FreeCubeMap(tool->filtered_env_map);
-    tool->filtered_env_map = AllocateCubeMap(max_mip_level + 1, face_size);
+    int face_size = params.face_size;
+    int max_mip_level = params.max_mip_level;
+    int num_samples = params.num_samples;
+    float roughness = params.roughness;
+    float roughness_increment = params.roughness_increment;
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
-    glDisable(GL_BLEND);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE);
 
     glUseProgram(tool->filter_ggx_cosine_program.id);
 
@@ -1795,18 +1855,21 @@ static void FilterCubeMap_GGXCosine(EnvMapTool* tool)
 
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_CUBE_MAP, tool->filtered_env_map->gl_id);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, max_mip_level);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
 
     glUniform1i(glGetUniformLocation(tool->filter_ggx_cosine_program.id, "u_EnvMap"), 0);
 
+    int start_sample = tool->filter_task.num_samples_completed;
+    int end_sample = start_sample + tool->filter_task.num_samples_per_frame;
+    if (end_sample > num_samples) end_sample = num_samples;
+
     glUniform1i(glGetUniformLocation(tool->filter_ggx_cosine_program.id, "u_NumSamples"), num_samples);
+    glUniform1i(glGetUniformLocation(tool->filter_ggx_cosine_program.id, "u_StartSample"), start_sample);
+    glUniform1i(glGetUniformLocation(tool->filter_ggx_cosine_program.id, "u_EndSample"), end_sample);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
 
     for (int mip = 0; mip <= max_mip_level; mip++)
     {
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, tool->filter_fbo);
         glViewport(0, 0, face_size, face_size);
 
         roughness = Math::Clamp(roughness, 0, 1);
@@ -1814,23 +1877,15 @@ static void FilterCubeMap_GGXCosine(EnvMapTool* tool)
 
         for (int face = 0; face < 6; ++face)
         {
-            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, mip, GL_RGBA32F, face_size, face_size, 0,
-                         GL_RGB, GL_FLOAT, NULL);
-
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                    GL_TEXTURE_CUBE_MAP_POSITIVE_X + face,
                                    tool->filtered_env_map->gl_id, mip);
-
-            glClear(GL_COLOR_BUFFER_BIT);
 
             glUniformMatrix3fv(glGetUniformLocation(tool->filter_ggx_cosine_program.id, "u_FaceBasis"), 1, GL_FALSE,
                                (const float*) (g_CubeMapFaces + face));
 
             glBindVertexArray(tool->filter_vao);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-
-            fprintf(stderr, "mip %d face %d done\n", mip, face);
-            glFinish();
         }
 
         face_size /= 2;
@@ -1839,10 +1894,38 @@ static void FilterCubeMap_GGXCosine(EnvMapTool* tool)
 
         roughness += roughness_increment;
     }
+
+    tool->filter_task.num_samples_completed = end_sample;
+    if (tool->filter_task.num_samples_completed == num_samples)
+        tool->filter_task.is_running = false;
 }
 
 static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dwheel, int dx, int dy)
 {
+    if (tool->filter_task.is_running)
+    {
+        switch (tool->filter_task.filter_params.type)
+        {
+        case FILTER_TYPE_COSINE:
+            if (tool->filter_task.filter_params.sh_approximation)
+                INVALID_CODE_PATH; // NOTE: SH approximation is done synchronously on the CPU side.
+            else
+                UpdateFilterCubeMap_Cosine(tool);
+            break;
+        case FILTER_TYPE_PHONG_COSINE:
+            UpdateFilterCubeMap_PhongCosine(tool);
+            break;
+        case FILTER_TYPE_BECKMANN_COSINE:
+            UpdateFilterCubeMap_BeckmannCosine(tool);
+            break;
+        case FILTER_TYPE_GGX_COSINE:
+            UpdateFilterCubeMap_GGXCosine(tool);
+            break;
+        default:
+            INVALID_CODE_PATH;
+        }
+    }
+
     // draw main panel
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
@@ -1866,6 +1949,8 @@ static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dw
                     tool->source_env_map = cubemap;
                     tool->display.env_map = 0;
                 }
+
+                tool->filter_task.is_running = false;
             }
         }
 
@@ -1893,6 +1978,8 @@ static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dw
                     SaveCubeMap(tool->filtered_env_map, filename, tool->layout);
                 else
                     SaveCubeMap(tool->filtered_env_map, filename, (CubeMapLayout) layout);
+
+                tool->filter_task.is_running = false;
             }
         }
 
@@ -1963,22 +2050,24 @@ static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dw
 
             if (ImGui::Button("Filter Cube Map"))
             {
+                tool->filter_task.is_running = false;
+
                 switch (tool->filter.type)
                 {
                 case FILTER_TYPE_COSINE:
                     if (tool->filter.sh_approximation)
                         FilterCubeMap_Cosine_SH(tool);
                     else
-                        FilterCubeMap_Cosine(tool);
+                        BeginFilterCubeMap(tool, tool->filter.face_size, 0);
                     break;
                 case FILTER_TYPE_PHONG_COSINE:
-                    FilterCubeMap_PhongCosine(tool);
+                    BeginFilterCubeMap(tool, tool->filter.face_size, tool->filter.max_mip_level);
                     break;
                 case FILTER_TYPE_BECKMANN_COSINE:
-                    FilterCubeMap_BeckmannCosine(tool);
+                    BeginFilterCubeMap(tool, tool->filter.face_size, tool->filter.max_mip_level);
                     break;
                 case FILTER_TYPE_GGX_COSINE:
-                    FilterCubeMap_GGXCosine(tool);
+                    BeginFilterCubeMap(tool, tool->filter.face_size, tool->filter.max_mip_level);
                     break;
                 default:
                     INVALID_CODE_PATH;
@@ -2005,6 +2094,34 @@ static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dw
             ImGui::DragFloat("exposure", &tool->display.exposure, 0.1f, -100.0f, 100.0f);
 
             ImGui::PopItemWidth();
+        }
+
+        // draw filtering progress overlay
+
+        {
+            char text[32] = {};
+            uint32_t color = 0;
+            if (tool->filter_task.is_running)
+            {
+                int progress = 100.0 * tool->filter_task.num_samples_completed / tool->filter_task.filter_params.num_samples;
+                snprintf(text, sizeof(text), "%d %%", progress);
+                color = 0xFF00FFFF;
+            }
+            else
+            {
+                snprintf(text, sizeof(text), "DONE");
+                color = 0xFF00FF00;
+            }
+
+            float text_width = ImGui::CalcTextSize(text).x;
+
+            const float padding_x = 10;
+            const float padding_y = 5;
+
+            ImDrawList* draw_list = ImGui::GetWindowDrawList();
+            draw_list->PushClipRectFullScreen();
+            draw_list->AddText(ImVec2(window_width - (text_width + padding_x), padding_y), color, text);
+            draw_list->PopClipRect();
         }
     }
     ImGui::End();
