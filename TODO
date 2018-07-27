@@ -1,6 +1,4 @@
 * Support angular and latitude-longitude env maps.
-* Cube map filtering takes place in a long running shader, which will probably force most drivers to reset the GPU.
-  A potential solution is to spread the work over multiple frames and evaluate a fixed number of samples every frame.
 * Remove unused code (this project was extracted from one of my other projects).
 * All input .hdr files are treated as RGBE.
 * The only supported .hdr resolution string is "-Y +X".

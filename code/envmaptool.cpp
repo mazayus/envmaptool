@@ -34,6 +34,11 @@
 
 #define MILLISECONDS_PER_FRAME  16
 
+// NOTE: Ideally FILTER_MS_PER_FRAME should be less than MILLISECONDS_PER_FRAME, but this leads to
+// a noticable increase in the total running time of the filter. Higher values of FILTER_MS_PER_FRAME
+// result in faster filtering, but less responsive UI.
+#define FILTER_MS_PER_FRAME     31
+
 static SDL_Window* sdl_window;
 static SDL_GLContext sdl_glcontext;
 static int window_width = INITIAL_WINDOW_WIDTH;
@@ -789,6 +794,8 @@ struct FilterTaskProgress
     bool is_running;
     int num_samples_completed;
     int num_samples_per_frame;
+
+    GLuint frame_time_query;
 };
 
 struct EnvMapTool
@@ -1558,7 +1565,9 @@ static void InitEnvMapTool(EnvMapTool* tool)
     tool->filter_task.filter_params = tool->filter;
     tool->filter_task.is_running = false;
     tool->filter_task.num_samples_completed = 0;
-    tool->filter_task.num_samples_per_frame = 32; // FIXME: hardcoded
+    tool->filter_task.num_samples_per_frame = 1;
+
+    glGenQueries(1, &tool->filter_task.frame_time_query);
 }
 
 #define SH_MAX_DEGREE 9
@@ -1641,7 +1650,11 @@ static void BeginFilterCubeMap(EnvMapTool* tool, int face_size, int max_mip_leve
     tool->filter_task.filter_params = tool->filter;
     tool->filter_task.is_running = true;
     tool->filter_task.num_samples_completed = 0;
-    tool->filter_task.num_samples_per_frame = 32; // FIXME: hardcoded
+    tool->filter_task.num_samples_per_frame = 1;
+
+    // NOTE: Force OpenGL to create a query, so that subsequent calls to glGetQueryObject won't fail.
+    glBeginQuery(GL_TIME_ELAPSED, tool->filter_task.frame_time_query);
+    glEndQuery(GL_TIME_ELAPSED);
 }
 
 static void UpdateFilterCubeMap_Cosine(EnvMapTool* tool)
@@ -1904,6 +1917,26 @@ static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dw
 {
     if (tool->filter_task.is_running)
     {
+        FilterTaskProgress* task = &tool->filter_task;
+
+        GLint query_result_available = 0;
+        glGetQueryObjectiv(task->frame_time_query, GL_QUERY_RESULT_AVAILABLE, &query_result_available);
+
+        if (query_result_available)
+        {
+            GLuint64 elapsed_time = 0;
+            glGetQueryObjectui64v(task->frame_time_query, GL_QUERY_RESULT, &elapsed_time);
+
+            float f = (elapsed_time > 1.0e6) ? Math::Clamp(FILTER_MS_PER_FRAME / (elapsed_time * 1.0e-6), 0.5, 2) : 2;
+            task->num_samples_per_frame *= f;
+            if (task->num_samples_per_frame < 1)
+                task->num_samples_per_frame = 1;
+        }
+
+
+
+        if (query_result_available) glBeginQuery(GL_TIME_ELAPSED, tool->filter_task.frame_time_query);
+
         switch (tool->filter_task.filter_params.type)
         {
         case FILTER_TYPE_COSINE:
@@ -1924,6 +1957,8 @@ static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dw
         default:
             INVALID_CODE_PATH;
         }
+
+        if (query_result_available) glEndQuery(GL_TIME_ELAPSED);
     }
 
     // draw main panel
