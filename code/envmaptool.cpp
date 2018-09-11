@@ -439,6 +439,7 @@ void SaveCubeMap(const CubeMap* cubemap, const char* filename, CubeMapLayout lay
 
     // NOTE: Allocate enough memory to hold any cubemap layout.
     float* image = new float[cubemap->face_size * cubemap->face_size * 12 * 3];
+    memset(image, 0, cubemap->face_size * cubemap->face_size * 12 * 3 * sizeof(float));
 
     int mip = 0;
     while (cubemap)
