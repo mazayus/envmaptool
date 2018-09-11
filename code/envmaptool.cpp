@@ -1607,6 +1607,25 @@ static void FilterCubeMap_Cosine_SH(EnvMapTool* tool)
     DownloadCubeMapFromGPU(tool->source_env_map);
     ProjectCubeMapOntoSH(tool->source_env_map, sh_max_degree, shcoeff_r, shcoeff_g, shcoeff_b);
 
+    {
+        printf("Source cubemap SH coefficients:\n");
+
+        printf("  R =");
+        for (int i = 0; i < sh_Count(sh_max_degree); ++i)
+            printf(" %f", shcoeff_r[i]);
+        printf("\n");
+
+        printf("  G =");
+        for (int i = 0; i < sh_Count(sh_max_degree); ++i)
+            printf(" %f", shcoeff_g[i]);
+        printf("\n");
+
+        printf("  B =");
+        for (int i = 0; i < sh_Count(sh_max_degree); ++i)
+            printf(" %f", shcoeff_b[i]);
+        printf("\n");
+    }
+
     static const float CosineLobeZH[] = {
         0.886226925, 1.023326708, 0.495415912, 0.0, -0.110778366, 0.0, 0.049927135, 0.0, -0.028546931, 0.0
     };
@@ -1631,6 +1650,25 @@ static void FilterCubeMap_Cosine_SH(EnvMapTool* tool)
 
     ReconstructCubeMapFromSH(tool->filtered_env_map, sh_max_degree, shcoeff_r, shcoeff_g, shcoeff_b);
     UploadCubeMapToGPU(tool->filtered_env_map);
+
+    {
+        printf("Filtered cubemap SH coefficients:\n");
+
+        printf("  R =");
+        for (int i = 0; i < sh_Count(sh_max_degree); ++i)
+            printf(" %f", shcoeff_r[i]);
+        printf("\n");
+
+        printf("  G =");
+        for (int i = 0; i < sh_Count(sh_max_degree); ++i)
+            printf(" %f", shcoeff_g[i]);
+        printf("\n");
+
+        printf("  B =");
+        for (int i = 0; i < sh_Count(sh_max_degree); ++i)
+            printf(" %f", shcoeff_b[i]);
+        printf("\n");
+    }
 }
 
 static void BeginFilterCubeMap(EnvMapTool* tool, int face_size, int max_mip_level)
