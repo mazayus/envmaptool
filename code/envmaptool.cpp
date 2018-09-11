@@ -731,6 +731,120 @@ void ReconstructCubeMapFromSH(CubeMap* cubemap, int degree, float* shcoeff_r, fl
     }
 }
 
+CubeMap* LoadEquirectangularMap(const char* filename)
+{
+    if (!filename[0])
+    {
+        fprintf(stderr, "LoadEquirectangularMap: empty filename\n");
+        return NULL;
+    }
+
+    float* image;
+    int width, height;
+    if (!HDRFileRead(filename, &image, &width, &height))
+    {
+        fprintf(stderr, "LoadEquirectangularMap: can't load image from '%s'\n", filename);
+        return NULL;
+    }
+
+    int face_size = (width / 4 > height / 2) ? width / 4 : height / 2;
+
+    CubeMap* cubemap = AllocateCubeMap(1, face_size);
+
+    for (int face = 0; face < 6; ++face)
+    {
+        for (int i = 0; i < cubemap->face_size; ++i)
+        {
+            for (int j = 0; j < cubemap->face_size; ++j)
+            {
+                Vector3 v = g_CubeMapFaces[face].z
+                    + g_CubeMapFaces[face].y * ((i+0.5) / (float) cubemap->face_size * 2 - 1)
+                    + g_CubeMapFaces[face].x * ((j+0.5) / (float) cubemap->face_size * 2 - 1);
+
+                v = Math::Normalize(v);
+
+                float theta = acos(v.y);
+                float phi = atan2(-v.x, -v.z);
+                if (phi < 0) phi += 2 * Math::PI;
+
+                float y = Math::Clamp(theta / Math::PI, 0, 1);
+                float x = Math::Clamp(phi / (2 * Math::PI), 0, 1);
+
+                int src_i = y * (height - 1);
+                int src_j = x * (width - 1);
+
+                float* pixel = &cubemap->face_pixels[face][(i * cubemap->face_size + j) * 3];
+
+                pixel[0] = image[(src_i * width + src_j) * 3    ];
+                pixel[1] = image[(src_i * width + src_j) * 3 + 1];
+                pixel[2] = image[(src_i * width + src_j) * 3 + 2];
+            }
+        }
+    }
+
+    delete[] image;
+
+    UploadCubeMapToGPU(cubemap);
+
+    return cubemap;
+}
+
+CubeMap* LoadSphereMap(const char* filename)
+{
+    if (!filename[0])
+    {
+        fprintf(stderr, "LoadSphereMap: empty filename\n");
+        return NULL;
+    }
+
+    float* image;
+    int width, height;
+    if (!HDRFileRead(filename, &image, &width, &height))
+    {
+        fprintf(stderr, "LoadSphereMap: can't load image from '%s'\n", filename);
+        return NULL;
+    }
+
+    int face_size = width > height ? width / 2 : height / 2;
+
+    CubeMap* cubemap = AllocateCubeMap(1, face_size);
+
+    for (int face = 0; face < 6; ++face)
+    {
+        for (int i = 0; i < cubemap->face_size; ++i)
+        {
+            for (int j = 0; j < cubemap->face_size; ++j)
+            {
+                Vector3 v = g_CubeMapFaces[face].z
+                    + g_CubeMapFaces[face].y * ((i+0.5) / (float) cubemap->face_size * 2 - 1)
+                    + g_CubeMapFaces[face].x * ((j+0.5) / (float) cubemap->face_size * 2 - 1);
+
+                v = Math::Normalize(v);
+
+                v = Math::Normalize(v + Vector3(0, 0, 1));
+
+                float y = Math::Clamp(1 - (v.y + 1) / 2, 0, 1);
+                float x = Math::Clamp((v.x + 1) / 2, 0, 1);
+
+                int src_i = y * (height - 1);
+                int src_j = x * (width - 1);
+
+                float* pixel = &cubemap->face_pixels[face][(i * cubemap->face_size + j) * 3];
+
+                pixel[0] = image[(src_i * width + src_j) * 3    ];
+                pixel[1] = image[(src_i * width + src_j) * 3 + 1];
+                pixel[2] = image[(src_i * width + src_j) * 3 + 2];
+            }
+        }
+    }
+
+    delete[] image;
+
+    UploadCubeMapToGPU(cubemap);
+
+    return cubemap;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct Camera
@@ -2037,6 +2151,32 @@ static void UpdateEnvMapTool(EnvMapTool* tool, int buttons, int x, int y, int dw
             if (ImGui::Button("Load Cube Map"))
             {
                 CubeMap* cubemap = LoadCubeMap(filename, &tool->layout);
+                if (cubemap)
+                {
+                    if (tool->source_env_map) FreeCubeMap(tool->source_env_map);
+                    tool->source_env_map = cubemap;
+                    tool->display.env_map = 0;
+                }
+
+                tool->filter_task.is_running = false;
+            }
+
+            if (ImGui::Button("Load Equirectangular Map"))
+            {
+                CubeMap* cubemap = LoadEquirectangularMap(filename);
+                if (cubemap)
+                {
+                    if (tool->source_env_map) FreeCubeMap(tool->source_env_map);
+                    tool->source_env_map = cubemap;
+                    tool->display.env_map = 0;
+                }
+
+                tool->filter_task.is_running = false;
+            }
+
+            if (ImGui::Button("Load Sphere Map"))
+            {
+                CubeMap* cubemap = LoadSphereMap(filename);
                 if (cubemap)
                 {
                     if (tool->source_env_map) FreeCubeMap(tool->source_env_map);
