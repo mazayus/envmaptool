@@ -1111,12 +1111,32 @@ static void Shutdown()
     SDL_Quit();
 }
 
+static const char* ImGuiGetClipboardText()
+{
+    static char* text = NULL;
+
+    if (text)
+        SDL_free(text);
+
+    text = SDL_GetClipboardText();
+
+    return text ? text : "";
+}
+
+static void ImGuiSetClipboardText(const char* text)
+{
+    SDL_SetClipboardText(text);
+}
+
 static void InitImGui()
 {
     ImGuiIO& io = ImGui::GetIO();
 
     io.DisplaySize.x = window_width;
     io.DisplaySize.y = window_height;
+
+    io.GetClipboardTextFn = ImGuiGetClipboardText;
+    io.SetClipboardTextFn = ImGuiSetClipboardText;
 
     io.KeyMap[ImGuiKey_Tab] = SDL_SCANCODE_TAB;
     io.KeyMap[ImGuiKey_LeftArrow] = SDL_SCANCODE_LEFT;
